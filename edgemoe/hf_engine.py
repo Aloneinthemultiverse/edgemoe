@@ -348,7 +348,20 @@ class HFEngine:
 
         # Load real backbone weights into the empty tensors (in-place).
         state = self._load_backbone_state()
-        model.load_state_dict(state, strict=False)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        # Anything in `missing` that is NOT an expert tensor is uninitialised
+        # garbage from `to_empty` → that breaks the forward. Surface it loudly.
+        leaked = [
+            k for k in missing
+            if ".experts." not in k and "rotary_emb" not in k
+        ]
+        if leaked:
+            print(
+                f"[hf_engine] WARNING: {len(leaked)} non-expert params missing "
+                f"from backbone state — forward will NaN. First 10: {leaked[:10]}"
+            )
+        if unexpected:
+            print(f"[hf_engine] unexpected keys in backbone: {unexpected[:10]}")
 
         model = model.to(self.config.device, dtype=self.config.dtype)
         model.eval()
