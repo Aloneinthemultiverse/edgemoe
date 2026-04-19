@@ -371,12 +371,17 @@ class HFEngine:
         top_p: float = 0.95,
     ) -> str:
         if isinstance(prompt, str):
-            ids = self.tokenizer(prompt, return_tensors="pt").input_ids
+            enc = self.tokenizer(prompt, return_tensors="pt")
+            ids = enc.input_ids
+            attn = enc.attention_mask
         else:
             ids = prompt
+            attn = torch.ones_like(ids)
         ids = ids.to(self.config.device)
+        attn = attn.to(self.config.device)
         out = self.model.generate(
             ids,
+            attention_mask=attn,
             max_new_tokens=max_tokens,
             do_sample=temperature > 0,
             temperature=max(temperature, 1e-5),
