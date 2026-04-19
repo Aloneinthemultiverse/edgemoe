@@ -105,9 +105,9 @@ class ExpertBank:
         return _rehydrate(header, payload)
 
     def _dequantize_all(self, record: dict) -> dict[str, torch.Tensor]:
-        """Group `.q/.scale/.zp` (or `.packed/.scale/.shape`) keys by base name."""
+        """Group `.q/.scale/.zp/.bits/.group_size/.shape` (or `.packed/.scale/.shape`) keys by base name."""
         dtype = record.get("dtype", "group_asym")
-        suffixes = (".q", ".scale", ".zp", ".packed", ".shape")
+        suffixes = (".q", ".scale", ".zp", ".packed", ".shape", ".bits", ".group_size")
         bases: set[str] = set()
         for key in record:
             for suf in suffixes:
@@ -131,13 +131,23 @@ class ExpertBank:
                     "shape": shape,
                 })
             else:
+                bits_field = record.get(f"{base}.bits", 4)
+                bits = int(bits_field.item() if torch.is_tensor(bits_field) else bits_field)
+                gs_field = record.get(f"{base}.group_size", 128)
+                group_size = int(gs_field.item() if torch.is_tensor(gs_field) else gs_field)
                 q_rec = {
                     "q": record[f"{base}.q"],
                     "scale": record[f"{base}.scale"],
-                    "bits": 4,
-                    "group_size": 128,
+                    "bits": bits,
+                    "group_size": group_size,
                     "mode": "group_asym",
                 }
+                shape_field = record.get(f"{base}.shape")
+                if shape_field is not None:
+                    q_rec["shape"] = (
+                        tuple(shape_field.tolist()) if torch.is_tensor(shape_field)
+                        else tuple(shape_field)
+                    )
                 if f"{base}.zp" in record:
                     q_rec["zp"] = record[f"{base}.zp"]
                 out[base] = self.quantizer.dequantize(q_rec)

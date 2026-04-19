@@ -73,14 +73,25 @@ class AdaptiveQuantizer:
         scale = (wmax - wmin).clamp_min(1e-8) / qmax
         zp = (-wmin / scale).round().clamp(0, qmax)
         q = (groups / scale + zp).round().clamp(0, qmax).to(torch.uint8)
-        return {
-            "q": q.view(rows, cols),
+        q = q.view(rows, cols)
+        out = {
             "scale": scale.squeeze(-1),
             "zp": zp.squeeze(-1).to(torch.uint8),
             "bits": bits,
             "group_size": self.group_size,
             "mode": "group_asym",
+            "shape": (rows, cols),
         }
+        if bits == 4:
+            # Pack two 4-bit values per byte → halves disk + RAM footprint.
+            flat = q.flatten()
+            if flat.numel() % 2:
+                flat = torch.cat([flat, torch.zeros(1, dtype=torch.uint8)])
+            pairs = flat.view(-1, 2)
+            out["q"] = (pairs[:, 0] | (pairs[:, 1] << 4)).to(torch.uint8)
+        else:
+            out["q"] = q
+        return out
 
     def _quantize_per_channel_symmetric(self, w: torch.Tensor, bits: int) -> dict:
         qmax = (1 << (bits - 1)) - 1
@@ -96,11 +107,22 @@ class AdaptiveQuantizer:
     def dequantize(self, packed: dict) -> torch.Tensor:
         mode = packed["mode"]
         if mode == "group_asym":
-            q = packed["q"].to(torch.float32)
+            bits = packed.get("bits", 4)
+            gs = packed["group_size"]
+            q = packed["q"]
+            shape = packed.get("shape")
+            if bits == 4 and q.dim() == 1:
+                if shape is None:
+                    raise ValueError("q4 nibble-packed record requires 'shape'")
+                rows, cols = int(shape[0]), int(shape[1])
+                lo = q & 0x0F
+                hi = (q >> 4) & 0x0F
+                full = torch.stack([lo, hi], dim=-1).flatten()[: rows * cols]
+                q = full.view(rows, cols)
+            q = q.to(torch.float32)
+            rows, cols = q.shape
             scale = packed["scale"].unsqueeze(-1)
             zp = packed["zp"].to(torch.float32).unsqueeze(-1)
-            rows, cols = q.shape
-            gs = packed["group_size"]
             q = q.view(rows, cols // gs, gs)
             w = (q - zp) * scale
             return w.view(rows, cols)

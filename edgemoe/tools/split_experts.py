@@ -185,6 +185,10 @@ def split_model(
                 q = adapt.quantize(t.float(), bits=quant_bits)
                 rec[f"{name}.q"] = q["q"]
                 rec[f"{name}.scale"] = q["scale"]
+                rec[f"{name}.bits"] = q["bits"]
+                rec[f"{name}.group_size"] = q["group_size"]
+                if "shape" in q:
+                    rec[f"{name}.shape"] = list(q["shape"])
                 if "zp" in q:
                     rec[f"{name}.zp"] = q["zp"]
 
