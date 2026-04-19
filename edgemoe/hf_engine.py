@@ -1,10 +1,12 @@
 """HFEngine — the working Kaggle path.
 
 Wraps a HuggingFace MoE model:
-  - loads config only, builds an empty model on the meta device
+  - loads config only, builds the model on CPU (so RoPE + other buffers
+    are properly initialised)
   - replaces every `mlp.experts` ModuleList with StreamingExperts proxies
-  - loads the backbone safetensors we produced via tools/split_experts.py
-  - uses the HF tokenizer + `model.generate()` for real text output
+    and collects to free the expert weights we just allocated
+  - loads the backbone safetensors produced via tools/split_experts.py
+  - moves the now-slim backbone onto `device` and runs `model.generate()`
 
 Covers Qwen3-MoE, Mixtral, OLMoE, DeepSeek-MoE, Phi-MoE — anything whose
 MoE block exposes `mlp.experts[i].{gate_proj, up_proj, down_proj}` and a
@@ -269,6 +271,7 @@ class HFEngine:
         )
 
     def _build_hf_model(self, top_k: int):
+        import gc
         from transformers import (
             AutoConfig, AutoModelForCausalLM, AutoTokenizer,
         )
@@ -276,13 +279,15 @@ class HFEngine:
         cfg = AutoConfig.from_pretrained(src, trust_remote_code=True)
         tok = AutoTokenizer.from_pretrained(src, trust_remote_code=True)
 
-        # Build the model shell on meta — no expert memory allocated.
-        with torch.device("meta"):
-            model = AutoModelForCausalLM.from_config(
-                cfg, trust_remote_code=True, torch_dtype=self.config.dtype,
-            )
+        # Build the full model on CPU so buffers like rotary_emb.inv_freq
+        # are actually initialised. Expert params are allocated here but
+        # we free them immediately below by swapping in StreamingExperts.
+        model = AutoModelForCausalLM.from_config(
+            cfg, trust_remote_code=True, torch_dtype=self.config.dtype,
+        )
 
-        # Swap every `mlp.experts` with streaming proxies.
+        # Swap every `mlp.experts` with streaming proxies → drops expert
+        # parameters so the next `gc.collect()` can release their memory.
         num_layers = self.manifest["num_layers"]
         num_experts = self.manifest["num_experts"]
         for L, layer in enumerate(_get_layers(model)):
@@ -302,20 +307,18 @@ class HFEngine:
                     )
                     break
 
-        # Load backbone weights — `assign=True` swaps meta tensors for real ones.
-        state = self._load_backbone_state()
-        missing, unexpected = model.load_state_dict(state, strict=False, assign=True)
-        # Any param still on meta that wasn't in state → zero-init on device.
-        # (Typically only the router gate would be unexpected-case; backbone covers the rest.)
-        for name, param in model.named_parameters():
-            if param.is_meta:
-                real = torch.zeros(
-                    param.shape, dtype=self.config.dtype, device=self.config.device,
-                )
-                _set_attr_tensor(model, name, real)
+        gc.collect()
 
-        model.to(self.config.device, dtype=self.config.dtype)
+        # Overwrite randomly-initialised backbone params with the real
+        # weights produced by tools/split_experts.py.
+        state = self._load_backbone_state()
+        model.load_state_dict(state, strict=False)
+
+        model = model.to(self.config.device, dtype=self.config.dtype)
         model.eval()
+        gc.collect()
+        if self.config.device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return model, tok
 
     def _load_backbone_state(self) -> dict[str, torch.Tensor]:
