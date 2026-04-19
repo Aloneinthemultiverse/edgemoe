@@ -9,8 +9,8 @@ from pathlib import Path
 
 
 def run_edgemoe(model: str, num_tokens: int = 100) -> dict:
-    from edgemoe.engine import EdgeMoE
-    engine = EdgeMoE(model=model)
+    from edgemoe import EdgeMoE
+    engine = EdgeMoE(model=model, backend="local")
     stats = engine.benchmark(num_tokens=num_tokens)
     engine.close()
     return stats

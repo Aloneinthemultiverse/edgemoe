@@ -100,7 +100,7 @@ def serve(model, port, backend):
               type=click.Choice(["q4", "q3", "q2", "bitnet"]))
 def prepare(hf_model, output, quantize):
     """Split a HuggingFace MoE model into per-expert files."""
-    from tools.split_experts import split_model
+    from edgemoe.tools.split_experts import split_model
     split_model(hf_model, output_dir=output, quant_mode=quantize)
 
 
@@ -109,7 +109,7 @@ def prepare(hf_model, output, quantize):
 @click.option("--bitnet/--no-bitnet", default=True)
 def quantize(experts_dir, bitnet):
     """Apply further quantization to a prepared model."""
-    from tools.quantize_experts import requantize_experts
+    from edgemoe.tools.quantize_experts import requantize_experts
     requantize_experts(experts_dir, to_bitnet=bitnet)
 
 
@@ -119,7 +119,7 @@ def quantize(experts_dir, bitnet):
 @click.option("--num-tokens", default=100)
 def benchmark(model, compare, num_tokens):
     """Benchmark inference; optionally compare against llama.cpp."""
-    from tools.benchmark import run_benchmark
+    from edgemoe.tools.benchmark import run_benchmark
     run_benchmark(model, compare=compare, num_tokens=num_tokens)
 
 
