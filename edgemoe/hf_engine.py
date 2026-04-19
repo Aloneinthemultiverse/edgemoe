@@ -311,15 +311,15 @@ class HFEngine:
         cfg = AutoConfig.from_pretrained(src, trust_remote_code=True)
         tok = AutoTokenizer.from_pretrained(src, trust_remote_code=True)
 
-        # Build the full model on CPU so buffers like rotary_emb.inv_freq
-        # are actually initialised. Expert params are allocated here but
-        # we free them immediately below by swapping in StreamingExperts.
-        model = AutoModelForCausalLM.from_config(
-            cfg, trust_remote_code=True, torch_dtype=self.config.dtype,
-        )
+        # Build on meta → zero CPU allocation, even for a 30B model.
+        with torch.device("meta"):
+            model = AutoModelForCausalLM.from_config(
+                cfg, trust_remote_code=True, torch_dtype=self.config.dtype,
+            )
 
-        # Swap every `mlp.experts` with streaming proxies → drops expert
-        # parameters so the next `gc.collect()` can release their memory.
+        # Swap expert ModuleLists FIRST. The children hold no tensors of
+        # their own (they route through `ExpertBank`), so `to_empty` below
+        # won't allocate the experts we're streaming.
         num_layers = self.manifest["num_layers"]
         num_experts = self.manifest["num_experts"]
         for L, layer in enumerate(_get_layers(model)):
@@ -327,10 +327,8 @@ class HFEngine:
             if mlp is None:
                 continue
             next_layer_id = L + 1 if L + 1 < num_layers else None
-            for attr in ("experts",):
-                if hasattr(mlp, attr):
-                    setattr(mlp, attr, StreamingExperts(self.bank, L, num_experts))
-            # Prefetch hook on the router
+            if hasattr(mlp, "experts"):
+                setattr(mlp, "experts", StreamingExperts(self.bank, L, num_experts))
             for gate_attr in ("gate", "router"):
                 gate = getattr(mlp, gate_attr, None)
                 if isinstance(gate, nn.Module):
@@ -339,10 +337,16 @@ class HFEngine:
                     )
                     break
 
-        gc.collect()
+        # Materialise the *remaining* meta tensors (backbone + router
+        # gates + layernorms + embeddings) with empty CPU memory. For a
+        # Qwen3-30B-A3B that's ~3 GB; for OLMoE-1B it's ~1 GB.
+        model = model.to_empty(device="cpu")
 
-        # Overwrite randomly-initialised backbone params with the real
-        # weights produced by tools/split_experts.py.
+        # `to_empty` leaves non-persistent buffers (RoPE `inv_freq`, etc.)
+        # filled with garbage. Re-run their init so attention works.
+        _reinit_rope_buffers(model)
+
+        # Load real backbone weights into the empty tensors (in-place).
         state = self._load_backbone_state()
         model.load_state_dict(state, strict=False)
 
@@ -432,3 +436,31 @@ def _set_attr_tensor(root: nn.Module, dotted: str, tensor: torch.Tensor) -> None
         setattr(obj, leaf, nn.Parameter(tensor, requires_grad=False))
     else:
         obj.register_buffer(leaf, tensor)
+
+
+def _reinit_rope_buffers(model: nn.Module) -> None:
+    """Recompute `inv_freq` on every RotaryEmbedding module.
+
+    After `to_empty()`, non-persistent buffers are real tensors with
+    uninitialised memory. Modern HF rotary classes expose either
+    `rope_init_fn(config, device)` or `_set_cos_sin_cache`/`config`,
+    so we call whichever is available to refill `inv_freq` correctly.
+    """
+    for name, module in model.named_modules():
+        cls_name = type(module).__name__
+        if "Rotary" not in cls_name:
+            continue
+        try:
+            if hasattr(module, "rope_init_fn") and hasattr(module, "config"):
+                inv_freq, scaling = module.rope_init_fn(module.config, device=None)
+                module.register_buffer("inv_freq", inv_freq, persistent=False)
+                if hasattr(module, "attention_scaling"):
+                    module.attention_scaling = scaling
+            elif hasattr(module, "inv_freq") and hasattr(module, "base") and hasattr(module, "dim"):
+                inv_freq = 1.0 / (
+                    module.base
+                    ** (torch.arange(0, module.dim, 2, dtype=torch.float32) / module.dim)
+                )
+                module.register_buffer("inv_freq", inv_freq, persistent=False)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[hf_engine] warn: could not reinit rotary '{name}' ({cls_name}): {exc}")
