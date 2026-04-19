@@ -454,26 +454,72 @@ def _set_attr_tensor(root: nn.Module, dotted: str, tensor: torch.Tensor) -> None
 def _reinit_rope_buffers(model: nn.Module) -> None:
     """Recompute `inv_freq` on every RotaryEmbedding module.
 
-    After `to_empty()`, non-persistent buffers are real tensors with
-    uninitialised memory. Modern HF rotary classes expose either
-    `rope_init_fn(config, device)` or `_set_cos_sin_cache`/`config`,
-    so we call whichever is available to refill `inv_freq` correctly.
+    After `to_empty()`, non-persistent buffers (like RoPE's `inv_freq`)
+    hold uninitialised memory — we've seen them come back as `[-inf..0]`,
+    which saturates attention and produces NaN logits.
+
+    We try `ROPE_INIT_FUNCTIONS` first (handles yarn / linear / ntk /
+    longrope rope_scaling variants), and fall back to the plain
+    `inv_freq = 1 / theta^(2i/d)` formula from the default rope.
     """
+    root_cfg = getattr(model, "config", None)
+    try:
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+    except Exception:  # noqa: BLE001
+        ROPE_INIT_FUNCTIONS = {}
+
+    patched = 0
     for name, module in model.named_modules():
         cls_name = type(module).__name__
         if "Rotary" not in cls_name:
             continue
+        cfg = getattr(module, "config", None) or root_cfg
+        if cfg is None:
+            print(f"[hf_engine] skip rotary {name}: no config")
+            continue
+
+        inv_freq = None
+        scaling = 1.0
+        # Preferred: use transformers' own init so rope_scaling is honoured.
         try:
-            if hasattr(module, "rope_init_fn") and hasattr(module, "config"):
-                inv_freq, scaling = module.rope_init_fn(module.config, device=None)
-                module.register_buffer("inv_freq", inv_freq, persistent=False)
-                if hasattr(module, "attention_scaling"):
-                    module.attention_scaling = scaling
-            elif hasattr(module, "inv_freq") and hasattr(module, "base") and hasattr(module, "dim"):
-                inv_freq = 1.0 / (
-                    module.base
-                    ** (torch.arange(0, module.dim, 2, dtype=torch.float32) / module.dim)
-                )
-                module.register_buffer("inv_freq", inv_freq, persistent=False)
+            rope_scaling = getattr(cfg, "rope_scaling", None) or {}
+            rope_type = (
+                rope_scaling.get("rope_type")
+                or rope_scaling.get("type")
+                or "default"
+            )
+            fn = ROPE_INIT_FUNCTIONS.get(rope_type)
+            if fn is not None:
+                inv_freq, scaling = fn(cfg, device=None)
         except Exception as exc:  # noqa: BLE001
-            print(f"[hf_engine] warn: could not reinit rotary '{name}' ({cls_name}): {exc}")
+            print(f"[hf_engine] rope_init_fn failed for {name}: {exc}")
+
+        # Fallback: default RoPE formula from config fields.
+        if inv_freq is None:
+            head_dim = getattr(cfg, "head_dim", None)
+            if head_dim is None:
+                hidden = getattr(cfg, "hidden_size", None)
+                n_heads = getattr(cfg, "num_attention_heads", None)
+                if hidden and n_heads:
+                    head_dim = hidden // n_heads
+            if head_dim is None:
+                print(f"[hf_engine] skip rotary {name}: cannot infer head_dim")
+                continue
+            theta = float(getattr(cfg, "rope_theta", 10000.0))
+            inv_freq = 1.0 / (
+                theta
+                ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+            )
+
+        module.register_buffer("inv_freq", inv_freq, persistent=False)
+        if hasattr(module, "attention_scaling"):
+            module.attention_scaling = scaling
+        patched += 1
+        print(
+            f"[hf_engine] reinit rotary {name or '<root>'} ({cls_name}) "
+            f"inv_freq[{tuple(inv_freq.shape)}] "
+            f"min={inv_freq.min().item():.3e} max={inv_freq.max().item():.3e}"
+        )
+
+    if patched == 0:
+        print("[hf_engine] WARNING: no RotaryEmbedding modules found to reinit")
