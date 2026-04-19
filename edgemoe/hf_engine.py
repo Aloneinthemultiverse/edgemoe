@@ -80,7 +80,8 @@ class ExpertBank:
         self.dtype = dtype
         self.quantizer = AdaptiveQuantizer()
 
-    def get(self, layer_id: int, expert_id: int) -> dict[str, torch.Tensor]:
+    def get(self, layer_id: int, expert_id: int) -> dict:
+        """Return a GPU-resident **packed** record. Dequant happens in forward."""
         cached = self.cache.get(layer_id, expert_id)
         if cached is not None:
             return cached
@@ -88,14 +89,65 @@ class ExpertBank:
         if raw is None:
             raw = self.storage.load_expert(layer_id, expert_id)
         record = self._deserialize(raw)
-        projections = self._dequantize_all(record)
-        projections = {
-            k: v.to(self.device, dtype=self.dtype, non_blocking=True)
-            for k, v in projections.items()
-        }
-        self.cache.put(layer_id, expert_id, projections)
+        record = self._move_packed_to_device(record)
+        self.cache.put(layer_id, expert_id, record)
         self.cache.record_access(layer_id, expert_id)
-        return projections
+        return record
+
+    def _move_packed_to_device(self, record: dict) -> dict:
+        """Ship packed tensors (q/scale/zp/packed) to VRAM, leave meta as-is."""
+        out: dict = {}
+        for k, v in record.items():
+            if torch.is_tensor(v):
+                out[k] = v.to(self.device, non_blocking=True)
+            else:
+                out[k] = v
+        return out
+
+    def dequantize_projection(self, record: dict, base: str) -> torch.Tensor:
+        """Dequantize a single projection (base=e.g. 'gate_proj.weight') to
+        self.dtype on self.device. All ops run on GPU."""
+        dtype = record.get("dtype", "group_asym")
+        if dtype == "ternary":
+            scale_field = record[f"{base}.scale"]
+            scale = float(
+                scale_field.item() if torch.is_tensor(scale_field) and scale_field.numel() == 1
+                else scale_field[0].item() if torch.is_tensor(scale_field) else scale_field
+            )
+            shape_field = record.get(f"{base}.shape", ())
+            shape = tuple(shape_field) if not torch.is_tensor(shape_field) else tuple(shape_field.tolist())
+            w = BitNetExpertQuantizer.dequantize({
+                "packed": record[f"{base}.packed"],
+                "scale": scale,
+                "shape": shape,
+            })
+            return w.to(self.dtype)
+
+        bits_field = record.get(f"{base}.bits", 4)
+        bits = int(bits_field.item() if torch.is_tensor(bits_field) else bits_field)
+        gs_field = record.get(f"{base}.group_size", 128)
+        group_size = int(gs_field.item() if torch.is_tensor(gs_field) else gs_field)
+        shape_field = record.get(f"{base}.shape")
+        shape = None
+        if shape_field is not None:
+            shape = tuple(shape_field.tolist()) if torch.is_tensor(shape_field) else tuple(shape_field)
+
+        q = record[f"{base}.q"]
+        if bits == 4 and q.dim() == 1:
+            if shape is None:
+                raise ValueError(f"q4 packed tensor {base} requires 'shape'")
+            rows, cols = int(shape[0]), int(shape[1])
+            lo = q & 0x0F
+            hi = (q >> 4) & 0x0F
+            full = torch.stack([lo, hi], dim=-1).flatten()[: rows * cols]
+            q = full.view(rows, cols)
+
+        rows, cols = q.shape
+        scale = record[f"{base}.scale"].to(self.dtype).unsqueeze(-1)
+        zp = record[f"{base}.zp"].to(self.dtype).unsqueeze(-1)
+        q = q.to(self.dtype).view(rows, cols // group_size, group_size)
+        w = (q - zp) * scale
+        return w.view(rows, cols)
 
     @staticmethod
     def _deserialize(raw: bytes) -> dict:
@@ -173,20 +225,33 @@ class StreamingExpert(nn.Module):
         self.expert_id = expert_id
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        proj = self.bank.get(self.layer_id, self.expert_id)
-        gate_w = _find(proj, "gate_proj")
-        up_w = _find(proj, "up_proj")
-        down_w = _find(proj, "down_proj")
+        rec = self.bank.get(self.layer_id, self.expert_id)
+        gate_b = _find_base(rec, "gate_proj")
+        up_b = _find_base(rec, "up_proj")
+        down_b = _find_base(rec, "down_proj")
+        gate_w = self.bank.dequantize_projection(rec, gate_b)
+        up_w = self.bank.dequantize_projection(rec, up_b)
+        down_w = self.bank.dequantize_projection(rec, down_b)
         gate = F.silu(hidden_states @ gate_w.T)
         up = hidden_states @ up_w.T
         return (gate * up) @ down_w.T
 
 
-def _find(proj: dict[str, torch.Tensor], needle: str) -> torch.Tensor:
-    for k, v in proj.items():
-        if needle in k:
-            return v
-    raise KeyError(f"{needle} missing from expert projections: {list(proj)}")
+def _find_base(record: dict, needle: str) -> str:
+    """Find the base tensor name (e.g. 'gate_proj.weight') in a packed record.
+
+    Packed records use suffixes like `.q` (group-asym) or `.packed` (ternary);
+    this strips the suffix to give the base so callers can look up sibling
+    fields (`.scale`, `.zp`, `.shape`, ...).
+    """
+    for k in record:
+        if needle not in k:
+            continue
+        if k.endswith(".q"):
+            return k[:-2]
+        if k.endswith(".packed"):
+            return k[: -len(".packed")]
+    raise KeyError(f"{needle} missing from expert record: {sorted(record)}")
 
 
 class StreamingExperts(nn.ModuleList):
