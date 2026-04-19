@@ -180,12 +180,44 @@ def _find(proj: dict[str, torch.Tensor], needle: str) -> torch.Tensor:
 
 
 class StreamingExperts(nn.ModuleList):
-    """Drop-in replacement for `mlp.experts`: indexable, iterable, but empty."""
+    """Drop-in replacement for `mlp.experts`.
+
+    Two dispatch conventions exist in HF MoE models:
+      - Mixtral / Qwen3-MoE / DeepSeek-MoE iterate `self.experts[i]` and
+        call the expert directly. Iteration + indexing already works via
+        `nn.ModuleList`.
+      - OLMoE / Phi-MoE call `self.experts(hidden_states, top_k_index,
+        top_k_weights)` as a single fused callable. That path needs the
+        `forward` below.
+    """
 
     def __init__(self, bank: ExpertBank, layer_id: int, num_experts: int):
         super().__init__(
             [StreamingExpert(bank, layer_id, i) for i in range(num_experts)]
         )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = hidden_states.shape[0]
+        top_k = top_k_index.shape[-1]
+        flat_experts = top_k_index.reshape(-1)
+        flat_weights = top_k_weights.reshape(-1).to(hidden_states.dtype)
+        row_idx = torch.arange(
+            num_tokens, device=hidden_states.device
+        ).repeat_interleave(top_k)
+
+        final = torch.zeros_like(hidden_states)
+        for eid in torch.unique(flat_experts).tolist():
+            mask = flat_experts == eid
+            tok_idx = row_idx[mask]
+            weights = flat_weights[mask].unsqueeze(-1)
+            y = self[eid](hidden_states[tok_idx]) * weights
+            final.index_add_(0, tok_idx, y)
+        return final
 
 
 class PrefetchHook:
